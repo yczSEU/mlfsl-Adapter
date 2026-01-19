@@ -1,1 +1,5 @@
 save*/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+data/.ipynb_checkpoints/
