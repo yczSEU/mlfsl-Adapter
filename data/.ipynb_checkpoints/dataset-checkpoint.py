@@ -147,33 +147,28 @@ def generate_MetaDataset(dataset_name, n_way, n_shot, image_size=224,
 
 def get_transform(transform, image_size):
     # ------------------------------------------------------------------
-    # 1. 动态选择 Normalization 参数
-    # 只有当 image_size 是 378 (CLIP专用) 时，才切换参数
-    # 其他所有情况 (Conv4=84, ResNet=224) 均保持原样，没有任何影响
+    # 针对 ViT-B (OpenCLIP) 进行修改
     # ------------------------------------------------------------------
-    if image_size == 378:
-        # OpenCLIP (dfn5b) 专用参数
-        mean = [0.48145466, 0.4578275, 0.40821073]
-        std = [0.26862954, 0.26130258, 0.27577711]
-    else:
-        # 你的原始参数 (ImageNet Standard)
-        mean = [0.485, 0.456, 0.406]
-        std = [0.229, 0.224, 0.225]
+    
+    # 1. 强制使用 CLIP 的 Normalization 参数
+    # 无论 image_size 是多少，只要是跑 CLIP 模型，都建议用这个
+    mean = [0.48145466, 0.4578275, 0.40821073]
+    std = [0.26862954, 0.26130258, 0.27577711]
 
-    # ------------------------------------------------------------------
-    # 2. 构建 Transform (把上面的变量填进去)
-    # ------------------------------------------------------------------
+    # 2. 构建 Transform
     if transform:
         return transforms.Compose([
+            # 训练阶段：随机裁剪
             transforms.RandomResizedCrop((image_size, image_size)),
             transforms.RandAugment(),
             transforms.ToTensor(),
-            transforms.Normalize(mean=mean, std=std)] # 使用变量
-        )
+            transforms.Normalize(mean=mean, std=std)
+        ])
     else:
         return transforms.Compose([
+            # 测试/验证阶段：先放大再中心裁剪 (标准的 evaluation pipeline)
             transforms.Resize((int(image_size * 1.15), int(image_size * 1.15))),
             transforms.CenterCrop((image_size, image_size)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=mean, std=std)] # 使用变量
-        )
+            transforms.Normalize(mean=mean, std=std)
+        ])

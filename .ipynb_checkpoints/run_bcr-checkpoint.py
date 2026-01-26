@@ -18,7 +18,7 @@ parser.add_argument('--max_epoch', type=int, default=500)
 parser.add_argument('--hidden_dim', type=int, default=100)
 parser.add_argument('--eta', type=float, default=0.5)
 parser.add_argument('--gamma', type=float, default=0.5)
-parser.add_argument('--num_workers', type=int, default=8)
+parser.add_argument('--num_workers', type=int, default=16)
 parser.add_argument('--device', type=str, default='cuda:0')
 parser.add_argument('--seed', type=int, default=0)
 
@@ -93,10 +93,10 @@ if __name__ == '__main__':
         n_way = np.minimum(n_way, 20)
     n_query = n_way // 2
 
-    train_dir = os.path.join(base_path, 'save_ViT_B_Apart-scale', dataset_name,
+    train_dir = os.path.join(base_path, 'save_ViT_B_Apart-Parallel-0.04f', dataset_name,
                              f'{algorithm}_{model_name}_{max_epoch}_{n_way}_{n_shot}_{n_query}_{seed}_{hidden_dim}_{eta}_{gamma}_L2',
                              'train')
-    log_dir = os.path.join(base_path, 'save_ViT_B_Apart-scale', dataset_name,
+    log_dir = os.path.join(base_path, 'save_ViT_B_Apart-Parallel-0.04f', dataset_name,
                            f'{algorithm}_{model_name}_{max_epoch}_{n_way}_{n_shot}_{n_query}_{seed}_{hidden_dim}_{eta}_{gamma}_L2',
                            'log')
     os.makedirs(train_dir, exist_ok=True)
@@ -124,8 +124,8 @@ if __name__ == '__main__':
 #   --dataset_name VG \
 #   --model_name ViT-B-Adapter \
 #   --n_way 10 \
-#   --n_shot 1 \
-#   --max_epoch 200 \
+#   --n_shot 5 \
+#   --max_epoch 30 \
 #   --hidden_dim 512 \
 #   --eta 0.5 \
 #   --gamma 0.5 \

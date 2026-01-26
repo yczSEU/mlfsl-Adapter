@@ -35,12 +35,8 @@ class MLLTemplate(nn.Module):
         num_support = self.n_way * self.n_shot
         avg_loss = 0
         
-        # 1. 修改这里：初始化进度条
-        # ncols=100 限制长度
-        # desc="Training" 进度条左侧描述
-        pbar = tqdm(train_loader, desc="Training", ncols=100)
-        
-        for batch in pbar: # <--- 循环对象改为 pbar
+        # 1. 干净的训练循环 (无 tqdm)
+        for batch in train_loader:
             x = batch['image'].to(self.device)
             y = batch['labels'].float()
 
@@ -60,11 +56,49 @@ class MLLTemplate(nn.Module):
             self.optimizer.step()
             
             avg_loss += loss.item()
+        if hasattr(self, 'scheduler'):
+            self.scheduler.step()
+            # (可选) 打印当前学习率看看
+            current_lr = self.scheduler.get_last_lr()[0]
+            print(f"[LR Info] Current LR decayed to: {current_lr:.6f}")
+
+        # 2. === 核心：Adapter 权重监控 (Epoch 结束时触发) ===
+        print("\n[Adapter Monitor]")
+        try:
+            # 路径: feature_extractor -> model -> visual -> transformer -> resblocks[0] -> mlp -> adapter
+            first_adapter = self.feature_extractor.model.visual.transformer.resblocks[0].mlp.adapter
             
-            # 2. 核心改动：实时在进度条右侧显示当前的 loss 值
-            # .item() 取出数值，保留4位小数
-            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+            # (A) 监控 Scale (Soft Limit 版本)
+            # 1. 获取底层的 Logits 参数
+            logits_data = first_adapter.scale_logits.data
+            logits_grad = first_adapter.scale_logits.grad
             
+            # 2. 手动计算当前实际生效的 Scale: 0.05 * sigmoid(logits)
+            max_val = first_adapter.max_scale_val
+            real_scale = max_val * torch.sigmoid(logits_data)
+            
+            # 打印信息
+            # Logits: 优化器实际更新的值 (大概在 -1.4 附近)
+            # Real Scale: 真正乘上去的系数 (应该在 0.01 ~ 0.05 之间)
+            print(f"  > Scale Logits: Val={logits_data.item():.4f}") 
+            print(f"  > Real Scale:   Val={real_scale.item():.6f} (Limit={max_val})")
+            
+            if logits_grad is not None:
+                print(f"    Logits Grad:  Mean={logits_grad.abs().mean().item():.8f}")
+            else:
+                print("    Logits Grad:  None")
+
+            # (B) 监控 Up_Proj: 确认内部权重是否有梯度流入 (保持不变)
+            up_weight = first_adapter.up_proj.weight.data
+            up_grad = first_adapter.up_proj.weight.grad
+            print(f"  > Up_Proj W:    Mean={up_weight.abs().mean().item():.6f}")
+            if up_grad is not None:
+                print(f"    Up_Proj G:    Mean={up_grad.abs().mean().item():.8f}")
+            
+        except AttributeError as e:
+            print(f"  Warning: Could not find adapter or attribute. Error: {e}")
+        print("-" * 50)
+
         return avg_loss
 
     def test_loop(self, test_loader):
@@ -74,12 +108,8 @@ class MLLTemplate(nn.Module):
         results = {}
         results['mAP'] = []
         
-        # 2. 修改这里：用 tqdm() 包裹 test_loader
-        # desc="Testing" 是进度条左边的文字
-        # ncols=100 是限制进度条长度，防止自动换行太难看
-        pbar = tqdm(test_loader, desc="Testing", ncols=100)
-        
-        for batch in pbar:  # <--- 循环对象变成了 pbar
+        # 干净的测试循环 (无 tqdm)
+        for batch in test_loader:
             x = batch['image'].to(self.device)
             y = batch['labels'].float()
 
@@ -104,9 +134,6 @@ class MLLTemplate(nn.Module):
             y_test = y_query.numpy()
             result = evaluation(y_test, y_pred)
             results['mAP'].append(result['mAP'])
-            
-            # 3. (可选) 骚操作：在进度条尾部实时显示当前这一个 batch 的 mAP
-            pbar.set_postfix({'curr_mAP': f"{result['mAP']*100:.2f}%"})
 
         results['mAP-std'] = 1.96 * np.std(results['mAP']) / np.sqrt(iter_num) * 100
         results['mAP'] = np.mean(results['mAP']) * 100

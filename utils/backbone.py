@@ -5,125 +5,138 @@ import torch.nn.functional as F
 import torch
 import os
 import open_clip
-try:
-    from peft import get_peft_model, LoraConfig
-except ImportError:
-    print("Warning: 'peft' library not found. LoRA models will fail if called.")
-base_path = os.path.dirname(__file__).replace('\\', '/') + '/..'
 
-
-class Flatten(nn.Module):
-    def __init__(self):
-        super(Flatten, self).__init__()
-
-    def forward(self, x):
-        return x.view(x.size(0), -1)
-# =========================================================================
-# 1. 严格复刻 APART 代码库的 Adapter 类
-# 源码参考: backbone/vision_transformer_adapter_pool_a.py -> class Adapter
-# =========================================================================
-# 修改 utils/backbone.py
-
-# 修改 utils/backbone.py
+# -------------------------------------------------------------------------
+# APART 核心复刻区
+# 参考: backbone/vision_transformer_adapter_pool_a.py
+# -------------------------------------------------------------------------
 
 class APART_Adapter(nn.Module):
-    def __init__(self, input_dim, bottleneck_dim=256): 
-        # 默认 bottleneck 设为 256 以适应 5-shot，如果是 1-shot 也可以用这个，Dropout 会帮忙
+    def __init__(self, input_dim, bottleneck_dim=64, dropout=0.1): 
+        """
+        APART 风格的 Adapter
+        1. bottleneck_dim: 论文倾向于较小的瓶颈 (如 64)，而不是 256，这有助于防过拟合
+        2. dropout: 源码中使用 0.1
+        """
         super().__init__()
-        self.input_dim = input_dim
-        self.down_size = bottleneck_dim
         
-        # === 核心：Channel-wise Scale (768维) ===
-        # 这里的 input_dim 在 ViT-B 中就是 768
-        # 初始化为 0，保证 Epoch 0 不破坏特征
-        self.scale = nn.Parameter(torch.zeros(self.input_dim)) 
-
-        self.adapter_layer_norm_before = nn.LayerNorm(self.input_dim)
-        self.down_proj = nn.Linear(self.input_dim, self.down_size)
+        self.down_proj = nn.Linear(input_dim, bottleneck_dim)
         self.non_linear_func = nn.ReLU()
-        self.up_proj = nn.Linear(self.down_size, self.input_dim)
+        self.up_proj = nn.Linear(bottleneck_dim, input_dim)
+        self.dropout = nn.Dropout(dropout)
         
-        # Dropout: 0.1 是一个兼顾 1-shot 和 5-shot 的安全值
-        self.dropout = nn.Dropout(0.1)
+        # === [复刻点 1] Scale 参数 ===
+        # 源码: self.scale = nn.Parameter(torch.ones(1))
+        # 初始化为 1.0，让梯度能正常流过 (依靠 Up 层的 0 初始化来保持初始静默)
+        # self.scale = nn.Parameter(torch.tensor(0.01))
+        self.scale_logits = nn.Parameter(torch.tensor(0.0))
+        
+        # 定义最大允许的 Scale (你的实验结论是 0.05)
+        self.max_scale_val = 0.05
 
-        # 初始化权重
+        # === [复刻点 2] 初始化策略 (严格参考源码) ===
         with torch.no_grad():
+            # Down: Kaiming Uniform
             nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
+            # Up: Zeros (关键！这保证了初始输出为 0)
             nn.init.zeros_(self.up_proj.weight)
+            # Biases: Zeros
             nn.init.zeros_(self.down_proj.bias)
             nn.init.zeros_(self.up_proj.bias)
 
     def forward(self, x):
-        # x shape: [Batch, Tokens, 768]
-        x = x.float()
-        x_norm = self.adapter_layer_norm_before(x)
+        origin_dtype = x.dtype
         
-        down = self.down_proj(x_norm)
+        # 强制将输入转为 Adapter 权重的数据类型 (通常是 torch.float32)
+        # 这样可以避免 "Half and Float" 的冲突
+        x = x.to(self.down_proj.weight.dtype)
+        
+        # Down -> ReLU -> Dropout -> Up -> Scale
+        down = self.down_proj(x)
         down = self.non_linear_func(down)
         down = self.dropout(down)
-        up = self.up_proj(down) # Output shape: [Batch, Tokens, 768]
+        up = self.up_proj(down)
+
+        current_scale = self.max_scale_val * torch.sigmoid(self.scale_logits)
+        # 计算结果
+        out = up * current_scale
         
-        # === Channel-wise 乘法 ===
-        # up: [B, N, 768] * scale: [768]
-        # PyTorch 自动广播，每一维特征乘以它专属的系数
-        return up * self.scale
+        # === 核心修复 ===
+        # 转回原始类型 (float16)，以便和外部的 original_out 相加
+        return out.to(origin_dtype)
 
 class APART_ParallelWrapper(nn.Module):
+    """
+    [复刻点 3] 并行结构 (Parallel)
+    APART 源码 Block 中: if ffn_option == 'parallel': x = x + adapt_x
+    """
     def __init__(self, original_mlp, input_dim):
         super().__init__()
         self.original_mlp = original_mlp 
-        # 这里的 input_dim 会被自动传入 768
-        self.adapter = APART_Adapter(input_dim, bottleneck_dim=256)
+        # 使用 64 维瓶颈，更适合 Few-shot
+        self.adapter = APART_Adapter(input_dim, bottleneck_dim=64)
 
     def forward(self, x):
+        # 1. 原始路径 (Frozen)
         with torch.no_grad():
             original_out = self.original_mlp(x)
         
+        # 2. Adapter 路径
+        # 输入 x 已经是归一化过的 (ln_2(x))
         adapter_out = self.adapter(x)
         
-        # 测试时融合策略：0.5
-        # 这是一个保险策略，防止 Adapter 修改过头
-        if not self.training:
-            return original_out + 0.5 * adapter_out.type(x.dtype)
-        else:
-            return original_out + adapter_out.type(x.dtype)
-# =========================================================================
-# 2. Backbone 定义
-# =========================================================================
+        # 3. 并行相加
+        return original_out + adapter_out.type(x.dtype)
+
+# -------------------------------------------------------------------------
+# Backbone 定义
+# -------------------------------------------------------------------------
+
+class Flatten(nn.Module):
+    def __init__(self):
+        super(Flatten, self).__init__()
+    def forward(self, x):
+        return x.view(x.size(0), -1)
+
 class OpenCLIPBackbone(nn.Module):
     def __init__(self, model_name='ViT-B-16', pretrained='laion2b_s34b_b88k', 
                  use_adapter=False):
         super(OpenCLIPBackbone, self).__init__()
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
-        print(f"Loading OpenCLIP: {model_name} (APART Implementation)")
+        print(f"Loading OpenCLIP: {model_name} (APART Replication Mode)")
         self.model = open_clip.create_model(model_name, pretrained=pretrained, 
                                             precision='fp16' if self.device == 'cuda' else 'fp32',
                                             device=self.device)
         
+        # 自动获取精度
         if hasattr(self.model.visual, 'conv1'):
             self.target_dtype = self.model.visual.conv1.weight.dtype
         else:
             self.target_dtype = next(self.model.visual.parameters()).dtype
 
-        # 冻结参数
+        # 1. 全局冻结
         for param in self.model.parameters():
             param.requires_grad = False
             
+        # 2. 注入 Adapter
         if use_adapter:
-            print("Injecting APART Adapters (Dim=64, ReLU, Inner-LN, Scale=0.1)...")
             embed_dim = 768 
             if hasattr(self.model.visual, 'width'): embed_dim = self.model.visual.width
-
+            
+            print(f"Injecting APART Parallel Adapters (Dim=64, Zero-Init Up, Scale=0.01)...")
+            
+            # 遍历所有 Transformer Block，替换 MLP
             for i, block in enumerate(self.model.visual.transformer.resblocks):
                 old_mlp = block.mlp
-                # 替换为 APART Wrapper
                 block.mlp = APART_ParallelWrapper(old_mlp, input_dim=embed_dim).to(self.device)
             
+            # 打印可训练参数量
             trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
             total = sum(p.numel() for p in self.model.parameters())
-            print(f"APART Injection Done! Params: {trainable} ({trainable/total:.2%})")
+            print(f"Injection Done! Trainable Params: {trainable} ({trainable/total:.2%})")
 
+        # 计算 Feature Dim
         if hasattr(self.model.visual, 'image_size'):
             img_size = self.model.visual.image_size
             if isinstance(img_size, tuple): img_size = img_size[0]
@@ -138,20 +151,22 @@ class OpenCLIPBackbone(nn.Module):
         if x.device != self.device: x = x.to(self.device)
         if x.dtype != self.target_dtype: x = x.type(self.target_dtype)
         return self.model.encode_image(x).float()
-        
-# 定义 ViT-B (Base) - 你的新主力模型
+
+# -------------------------------------------------------------------------
+# 模型入口函数
+# -------------------------------------------------------------------------
+
 def vit_b_openclip():
-    # 86M 参数，ImageNet Zero-shot ~72%
-    return OpenCLIPBackbone(model_name='ViT-B-16', pretrained='laion2b_s34b_b88k')
-def vit_b_lora():
-    return OpenCLIPBackbone(model_name='ViT-B-16', pretrained='laion2b_s34b_b88k', use_lora=True)
+    # 纯净版 ViT-B (Baseline)
+    return OpenCLIPBackbone(model_name='ViT-B-16', pretrained='laion2b_s34b_b88k', use_adapter=False)
+
 def vit_b_adapter():
-    #这就是你要调用的新模型
+    # APART Adapter 版 ViT-B
     return OpenCLIPBackbone(model_name='ViT-B-16', pretrained='laion2b_s34b_b88k', use_adapter=True)
-# (可选) 保留 ViT-H 的定义，以防万一你想跑对比，用的是同一套通用类
+
 def vit_h_openclip():
     return OpenCLIPBackbone(model_name='ViT-H-14-378-quickgelu', pretrained='dfn5b')
-
+    
 class Conv64F(nn.Module):
     """
     Four convolutional blocks network, each of which consists of a Covolutional layer,
@@ -462,6 +477,5 @@ model_dict = {
     'ResNet101': ResNet101,
     'ViT-H-CLIP': vit_h_openclip,
     'ViT-B-CLIP': vit_b_openclip,
-    'ViT-B-LoRA': vit_b_lora,
     'ViT-B-Adapter': vit_b_adapter,
 }
