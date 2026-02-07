@@ -63,6 +63,7 @@ def _test():
     result = model.test_loop(test_loader)
     mAP, mAP_std = result['mAP'], result['mAP-std']
     print(f'{mAP}±{mAP_std}')
+    model.print_test_stats()
 
 
 if __name__ == '__main__':
@@ -93,10 +94,10 @@ if __name__ == '__main__':
         n_way = np.minimum(n_way, 20)
     n_query = n_way // 2
 
-    train_dir = os.path.join(base_path, 'save_ViT_B_Apart-Parallel-0.04f', dataset_name,
+    train_dir = os.path.join(base_path, 'save','ViT_B_Apart_Pool_256_KL_noDetach_cos_A10', dataset_name,
                              f'{algorithm}_{model_name}_{max_epoch}_{n_way}_{n_shot}_{n_query}_{seed}_{hidden_dim}_{eta}_{gamma}_L2',
                              'train')
-    log_dir = os.path.join(base_path, 'save_ViT_B_Apart-Parallel-0.04f', dataset_name,
+    log_dir = os.path.join(base_path, 'save','ViT_B_Apart_Pool_256_KL_noDetach_cos_A10', dataset_name,
                            f'{algorithm}_{model_name}_{max_epoch}_{n_way}_{n_shot}_{n_query}_{seed}_{hidden_dim}_{eta}_{gamma}_L2',
                            'log')
     os.makedirs(train_dir, exist_ok=True)
@@ -121,11 +122,11 @@ if __name__ == '__main__':
     _test()
 
 # HF_ENDPOINT=https://hf-mirror.com XDG_CACHE_HOME=/root/autodl-tmp/cache python run_bcr.py \
-#   --dataset_name VG \
+#   --dataset_name COCO\
 #   --model_name ViT-B-Adapter \
 #   --n_way 10 \
 #   --n_shot 5 \
-#   --max_epoch 30 \
+#   --max_epoch 10 \
 #   --hidden_dim 512 \
 #   --eta 0.5 \
 #   --gamma 0.5 \

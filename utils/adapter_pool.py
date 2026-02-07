@@ -4,10 +4,10 @@ import torch.nn.functional as F
 import math
 
 # =========================================================================
-# 1. APART Adapter 单体 (保持之前调试好的最佳逻辑不变)
+# 1. APART Adapter 单体 (修改版：增加最小 Scale 保底)
 # =========================================================================
 class APART_Adapter(nn.Module):
-    def __init__(self, input_dim, bottleneck_dim=64, dropout=0.1): 
+    def __init__(self, input_dim, bottleneck_dim=256, dropout=0.1): 
         super().__init__()
         
         self.down_proj = nn.Linear(input_dim, bottleneck_dim)
@@ -15,17 +15,19 @@ class APART_Adapter(nn.Module):
         self.up_proj = nn.Linear(bottleneck_dim, input_dim)
         self.dropout = nn.Dropout(dropout)
         
-        # === 核心设置 (保持不变) ===
-        # 使用 Logits 控制 Scale
-        # 初始值 0.0 -> Sigmoid(0.0)=0.5 -> Scale=0.025 (平稳起步)
-        self.scale_logits = nn.Parameter(torch.tensor(0.0))
+        # === 核心设置 ===
+        # 初始 logits 设置为 0.0，对应的 sigmoid 约为 0.5
+        # 这样初始 scale 会在 (min + max) / 2 附近
+        self.scale_logits = nn.Parameter(torch.tensor(-5.0))
         
-        # 强制最大 Scale 不超过 0.05 (甜点位)
-        self.max_scale_val = 0.05
+        # [关键修改] 定义 Scale 的活动范围
+        self.min_scale_val = 0.07  # 设置底薪：最少也要有 1% 的贡献
+        self.max_scale_val = 0.10  # 设置上限：最多 20% (之前建议放宽到 0.2)
 
         with torch.no_grad():
+            # 使用较小的正态分布初始化，防止一开始是纯 0 被 Weight Decay 吸住
             nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
-            nn.init.zeros_(self.up_proj.weight)
+            nn.init.normal_(self.up_proj.weight, mean=0.0, std=1e-4) # 给一点点初始扰动
             nn.init.zeros_(self.down_proj.bias)
             nn.init.zeros_(self.up_proj.bias)
 
@@ -40,8 +42,11 @@ class APART_Adapter(nn.Module):
         down = self.dropout(down)
         up = self.up_proj(down)
         
-        # 3. 计算受限 Scale (Sigmoid 机制)
-        current_scale = self.max_scale_val * torch.sigmoid(self.scale_logits)
+        # 3. [关键修改] 计算带保底的 Scale
+        # 逻辑：scale = min + (max - min) * sigmoid(logits)
+        # 这样无论 logits 怎么变，scale 永远不会小于 self.min_scale_val
+        probs = torch.sigmoid(self.scale_logits)
+        current_scale = self.min_scale_val + (self.max_scale_val - self.min_scale_val) * probs
         
         out = up * current_scale
         
@@ -50,7 +55,7 @@ class APART_Adapter(nn.Module):
 
 
 # =========================================================================
-# 2. Pool Wrapper (并行池化包装器)
+# 2. Pool Wrapper (保持不变)
 # =========================================================================
 class APART_PoolWrapper(nn.Module):
     def __init__(self, original_mlp, input_dim, pool_size=5):
@@ -59,7 +64,7 @@ class APART_PoolWrapper(nn.Module):
         
         # 创建专家池：包含 pool_size 个独立的 Adapter
         self.adapters = nn.ModuleList([
-            APART_Adapter(input_dim, bottleneck_dim=64) 
+            APART_Adapter(input_dim, bottleneck_dim=256) 
             for _ in range(pool_size)
         ])
         
@@ -87,7 +92,7 @@ class APART_PoolWrapper(nn.Module):
 
 
 # =========================================================================
-# 3. Router (路由器)
+# 3. Router (保持不变)
 # =========================================================================
 class AdapterRouter(nn.Module):
     def __init__(self, input_dim, pool_size=5):
@@ -95,24 +100,35 @@ class AdapterRouter(nn.Module):
         self.pool_size = pool_size
         self.input_dim = input_dim
         
-        # 专家 Key：形状 [pool_size, input_dim]
-        # 初始化为正交矩阵，让专家初始状态尽量“互不相同”
         self.prompt_key = nn.Parameter(torch.randn(pool_size, input_dim))
-        nn.init.orthogonal_(self.prompt_key)
+        # === [新增] 初始化标志 ===
+        # 标记是否已经用真实数据清洗过
+        self.is_initialized = False
+        
+        # 记录当前 Epoch (需要外部更新)
+        self.current_epoch = 0
 
-    def get_best_expert_idx(self, task_embedding):
-        """
-        根据 Support Set 的任务特征，选择最匹配的专家。
-        task_embedding: [1, input_dim]
-        返回: int (最佳专家 ID)
-        """
-        # 归一化 (Cosine Similarity 前置步骤)
+    def get_best_expert_idx(self, task_embedding, training=True):
+        # task_embedding shape: [Batch_Size, Dim] (Batch_Size 这里通常等于 N_way)
+        
+        # 1. 计算相似度 [Batch_Size, Pool_Size]
         keys_norm = F.normalize(self.prompt_key, p=2, dim=1)
         task_norm = F.normalize(task_embedding, p=2, dim=1)
+        similarity = torch.matmul(task_norm, keys_norm.t()) 
         
-        # 计算相似度: [1, dim] @ [dim, pool_size] -> [1, pool_size]
-        similarity = torch.matmul(task_norm, keys_norm.t())
+        # 2. 策略选择
+        if training:
+            # 加上噪声防抖
+            noise = torch.randn_like(similarity) * 0.1 
+            noisy_similarity = similarity + noise
+            topk_values, topk_indices = torch.topk(similarity, k=2, dim=1)
         
-        # 选分最高的专家
-        best_idx = torch.argmax(similarity, dim=1).item()
-        return best_idx
+        # 计算 Softmax 权重，用于加权求和
+        routing_weights = F.softmax(topk_values, dim=1) 
+        
+        # 统计 (只统计第一名，或者都统计)
+        if training and hasattr(self, 'expert_usage_counts'):
+            for idx in topk_indices[:, 0]: # 统计 Top-1
+                self.expert_usage_counts[idx.item()] += 1
+                
+        return topk_indices, routing_weights

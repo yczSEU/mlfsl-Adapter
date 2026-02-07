@@ -6,91 +6,7 @@ import torch
 import os
 import open_clip
 
-# -------------------------------------------------------------------------
-# APART 核心复刻区
-# 参考: backbone/vision_transformer_adapter_pool_a.py
-# -------------------------------------------------------------------------
-
-class APART_Adapter(nn.Module):
-    def __init__(self, input_dim, bottleneck_dim=64, dropout=0.1): 
-        """
-        APART 风格的 Adapter
-        1. bottleneck_dim: 论文倾向于较小的瓶颈 (如 64)，而不是 256，这有助于防过拟合
-        2. dropout: 源码中使用 0.1
-        """
-        super().__init__()
-        
-        self.down_proj = nn.Linear(input_dim, bottleneck_dim)
-        self.non_linear_func = nn.ReLU()
-        self.up_proj = nn.Linear(bottleneck_dim, input_dim)
-        self.dropout = nn.Dropout(dropout)
-        
-        # === [复刻点 1] Scale 参数 ===
-        # 源码: self.scale = nn.Parameter(torch.ones(1))
-        # 初始化为 1.0，让梯度能正常流过 (依靠 Up 层的 0 初始化来保持初始静默)
-        # self.scale = nn.Parameter(torch.tensor(0.01))
-        self.scale_logits = nn.Parameter(torch.tensor(0.0))
-        
-        # 定义最大允许的 Scale (你的实验结论是 0.05)
-        self.max_scale_val = 0.05
-
-        # === [复刻点 2] 初始化策略 (严格参考源码) ===
-        with torch.no_grad():
-            # Down: Kaiming Uniform
-            nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
-            # Up: Zeros (关键！这保证了初始输出为 0)
-            nn.init.zeros_(self.up_proj.weight)
-            # Biases: Zeros
-            nn.init.zeros_(self.down_proj.bias)
-            nn.init.zeros_(self.up_proj.bias)
-
-    def forward(self, x):
-        origin_dtype = x.dtype
-        
-        # 强制将输入转为 Adapter 权重的数据类型 (通常是 torch.float32)
-        # 这样可以避免 "Half and Float" 的冲突
-        x = x.to(self.down_proj.weight.dtype)
-        
-        # Down -> ReLU -> Dropout -> Up -> Scale
-        down = self.down_proj(x)
-        down = self.non_linear_func(down)
-        down = self.dropout(down)
-        up = self.up_proj(down)
-
-        current_scale = self.max_scale_val * torch.sigmoid(self.scale_logits)
-        # 计算结果
-        out = up * current_scale
-        
-        # === 核心修复 ===
-        # 转回原始类型 (float16)，以便和外部的 original_out 相加
-        return out.to(origin_dtype)
-
-class APART_ParallelWrapper(nn.Module):
-    """
-    [复刻点 3] 并行结构 (Parallel)
-    APART 源码 Block 中: if ffn_option == 'parallel': x = x + adapt_x
-    """
-    def __init__(self, original_mlp, input_dim):
-        super().__init__()
-        self.original_mlp = original_mlp 
-        # 使用 64 维瓶颈，更适合 Few-shot
-        self.adapter = APART_Adapter(input_dim, bottleneck_dim=64)
-
-    def forward(self, x):
-        # 1. 原始路径 (Frozen)
-        with torch.no_grad():
-            original_out = self.original_mlp(x)
-        
-        # 2. Adapter 路径
-        # 输入 x 已经是归一化过的 (ln_2(x))
-        adapter_out = self.adapter(x)
-        
-        # 3. 并行相加
-        return original_out + adapter_out.type(x.dtype)
-
-# -------------------------------------------------------------------------
-# Backbone 定义
-# -------------------------------------------------------------------------
+from utils.adapter_pool import APART_PoolWrapper, AdapterRouter
 
 class Flatten(nn.Module):
     def __init__(self):
@@ -98,45 +14,29 @@ class Flatten(nn.Module):
     def forward(self, x):
         return x.view(x.size(0), -1)
 
+# utils/backbone.py
+
 class OpenCLIPBackbone(nn.Module):
     def __init__(self, model_name='ViT-B-16', pretrained='laion2b_s34b_b88k', 
-                 use_adapter=False):
+                 use_adapter=False, pool_size=5):
         super(OpenCLIPBackbone, self).__init__()
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
-        print(f"Loading OpenCLIP: {model_name} (APART Replication Mode)")
+        print(f"Loading OpenCLIP: {model_name}")
         self.model = open_clip.create_model(model_name, pretrained=pretrained, 
                                             precision='fp16' if self.device == 'cuda' else 'fp32',
                                             device=self.device)
         
-        # 自动获取精度
         if hasattr(self.model.visual, 'conv1'):
             self.target_dtype = self.model.visual.conv1.weight.dtype
         else:
             self.target_dtype = next(self.model.visual.parameters()).dtype
 
-        # 1. 全局冻结
-        for param in self.model.parameters():
-            param.requires_grad = False
+        # 维度计算
+        transformer_width = 768 
+        if hasattr(self.model.visual, 'width'): 
+            transformer_width = self.model.visual.width
             
-        # 2. 注入 Adapter
-        if use_adapter:
-            embed_dim = 768 
-            if hasattr(self.model.visual, 'width'): embed_dim = self.model.visual.width
-            
-            print(f"Injecting APART Parallel Adapters (Dim=64, Zero-Init Up, Scale=0.01)...")
-            
-            # 遍历所有 Transformer Block，替换 MLP
-            for i, block in enumerate(self.model.visual.transformer.resblocks):
-                old_mlp = block.mlp
-                block.mlp = APART_ParallelWrapper(old_mlp, input_dim=embed_dim).to(self.device)
-            
-            # 打印可训练参数量
-            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-            total = sum(p.numel() for p in self.model.parameters())
-            print(f"Injection Done! Trainable Params: {trainable} ({trainable/total:.2%})")
-
-        # 计算 Feature Dim
         if hasattr(self.model.visual, 'image_size'):
             img_size = self.model.visual.image_size
             if isinstance(img_size, tuple): img_size = img_size[0]
@@ -147,326 +47,79 @@ class OpenCLIPBackbone(nn.Module):
             out = self.model.encode_image(dummy)
             self.final_feat_dim = out.shape[1]
 
-    def forward(self, x):
+        for param in self.model.parameters():
+            param.requires_grad = False
+            
+        self.use_adapter = use_adapter
+        
+        if use_adapter:
+            print(f"Mode: Adapter Pool (Size={pool_size})")
+            # Router 的 bottleneck_dim 也要传，如果 Router 内部用了线性层的话 (你的 Router 代码看起来没用 bottleneck，但传进去无妨)
+            self.router = AdapterRouter(input_dim=self.final_feat_dim, pool_size=pool_size).to(self.device)
+            
+            # 2. [修改这里] 把死数字 64 改成变量 {bottleneck_dim}
+            print(f"Injecting Adapter Pool (Size={pool_size}, Dim=256, Limit=0.05, Init=0.01)...")
+            
+            for i, block in enumerate(self.model.visual.transformer.resblocks):
+                old_mlp = block.mlp
+                # 3. [关键] 把 bottleneck_dim 传给 Wrapper，Wrapper 再传给 Adapter
+                block.mlp = APART_PoolWrapper(old_mlp, input_dim=transformer_width, 
+                                              pool_size=pool_size).to(self.device)
+            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in self.model.parameters())
+            print(f"Injection Done! Trainable Params: {trainable} ({trainable/total:.2%})")
+
+    def get_task_embedding(self, support_images):
+        with torch.no_grad():
+            # 这里必须显式传 use_pure_clip=True，这会触发 forward 里的 -1 逻辑
+            features = self.forward(support_images, use_pure_clip=True)
+            task_emb = features.mean(dim=0, keepdim=True) 
+            return task_emb
+
+    def forward(self, x, adapter_idx=None, use_pure_clip=False): # <--- [修改1] 默认改为 None
+        """
+        x: 图片 Tensor
+        adapter_idx: 指定专家 ID。如果为 None，则保持当前状态不变！
+        use_pure_clip: 强制使用纯 CLIP (Active Idx = -1)
+        """
         if x.device != self.device: x = x.to(self.device)
         if x.dtype != self.target_dtype: x = x.type(self.target_dtype)
-        return self.model.encode_image(x).float()
+        
+        if self.use_adapter:
+            # [修改2] 只有在明确指定了 idx 或者要求纯 CLIP 时，才去修改状态
+            # 如果 adapter_idx 是 None，说明外部已经通过 _set_active_adapter 设置好了，这里不要动！
+            if use_pure_clip:
+                target_idx = -1
+                for block in self.model.visual.transformer.resblocks:
+                    if hasattr(block.mlp, 'active_idx'):
+                        block.mlp.active_idx = target_idx
+            elif adapter_idx is not None:
+                for block in self.model.visual.transformer.resblocks:
+                    if hasattr(block.mlp, 'active_idx'):
+                        block.mlp.active_idx = adapter_idx
 
+        return self.model.encode_image(x).float()
 # -------------------------------------------------------------------------
 # 模型入口函数
 # -------------------------------------------------------------------------
 
 def vit_b_openclip():
-    # 纯净版 ViT-B (Baseline)
     return OpenCLIPBackbone(model_name='ViT-B-16', pretrained='laion2b_s34b_b88k', use_adapter=False)
 
 def vit_b_adapter():
-    # APART Adapter 版 ViT-B
-    return OpenCLIPBackbone(model_name='ViT-B-16', pretrained='laion2b_s34b_b88k', use_adapter=True)
+    return OpenCLIPBackbone(model_name='ViT-B-16', pretrained='laion2b_s34b_b88k', use_adapter=True, pool_size=5)
 
 def vit_h_openclip():
     return OpenCLIPBackbone(model_name='ViT-H-14-378-quickgelu', pretrained='dfn5b')
     
 class Conv64F(nn.Module):
-    """
-    Four convolutional blocks network, each of which consists of a Covolutional layer,
-    a Batch Normalizaiton layer, a ReLU layer and a Maxpooling layer.
-    Used in the original ProtoNet: https://github.com/jakesnell/prototypical-networks.git.
-
-    Input:  3 * 84 *84
-    Output: 64 * 5 * 5
-    """
-
-    def __init__(
-            self,
-            is_flatten=True,
-            is_feature=False,
-            leaky_relu=False,
-            negative_slope=0.2,
-            last_pool=True,
-            maxpool_last2=True,
-    ):
-        super(Conv64F, self).__init__()
-
-        self.is_flatten = is_flatten
-        self.is_feature = is_feature
-        self.last_pool = last_pool
-        self.maxpool_last2 = maxpool_last2
-
-        if leaky_relu:
-            activation = nn.LeakyReLU(negative_slope=negative_slope, inplace=True)
-        else:
-            activation = nn.ReLU(inplace=True)
-
-        self.layer1 = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(64),
-            activation,
-            nn.MaxPool2d(kernel_size=2, stride=2),
-        )
-        self.layer2 = nn.Sequential(
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(64),
-            activation,
-            nn.MaxPool2d(kernel_size=2, stride=2),
-        )
-        self.layer3 = nn.Sequential(
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(64),
-            activation,
-        )
-        self.layer3_maxpool = nn.MaxPool2d(kernel_size=2, stride=2)
-
-        self.layer4 = nn.Sequential(
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(64),
-            activation,
-        )
-        self.layer4_pool = nn.MaxPool2d(kernel_size=2, stride=2)
-        if is_flatten:
-            self.final_feat_dim = 1600
-        else:
-            self.final_feat_dim = (64, 5, 5)
-
-    def forward(self, x):
-        out1 = self.layer1(x)
-        out2 = self.layer2(out1)
-        out3 = self.layer3(out2)
-
-        if self.maxpool_last2:
-            out3 = self.layer3_maxpool(out3)  # for some methods(relation net etc.)
-
-        out4 = self.layer4(out3)
-        if self.last_pool:
-            out4 = self.layer4_pool(out4)
-
-        if self.is_flatten:
-            out4 = out4.view(out4.size(0), -1)
-
-        if self.is_feature:
-            return out1, out2, out3, out4
-
-        return out4
-
-
-# Basic ResNet model
-def init_layer(L):
-    if isinstance(L, nn.Conv2d):
-        n = L.kernel_size[0] * L.kernel_size[1] * L.out_channels
-        L.weight.data.normal_(0, math.sqrt(2.0 / float(n)))
-    elif isinstance(L, nn.BatchNorm2d):
-        L.weight.data.fill_(1)
-        L.bias.data.fill_(0)
-
-
-class Conv2d_fw(nn.Conv2d):  # used in MAML to forward input with fast weight
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, bias=True):
-        super(Conv2d_fw, self).__init__(in_channels, out_channels, kernel_size, stride=stride, padding=padding,
-                                        bias=bias)
-        self.weight.fast = None
-        if not self.bias is None:
-            self.bias.fast = None
-
-    def forward(self, x):
-        if self.bias is None:
-            if self.weight.fast is not None:
-                out = F.conv2d(x, self.weight.fast, None, stride=self.stride, padding=self.padding)
-            else:
-                out = super(Conv2d_fw, self).forward(x)
-        else:
-            if self.weight.fast is not None and self.bias.fast is not None:
-                out = F.conv2d(x, self.weight.fast, self.bias.fast, stride=self.stride, padding=self.padding)
-            else:
-                out = super(Conv2d_fw, self).forward(x)
-        return out
-
-
-class BatchNorm2d_fw(nn.BatchNorm2d):  # used in MAML to forward input with fast weight
-    def __init__(self, num_features):
-        super(BatchNorm2d_fw, self).__init__(num_features)
-        self.weight.fast = None
-        self.bias.fast = None
-
-    def forward(self, x):
-        running_mean = torch.zeros(x.data.size()[1])
-        running_var = torch.ones(x.data.size()[1])
-        running_mean = running_mean.to(x.device)
-        running_var = running_var.to(x.device)
-        if self.weight.fast is not None and self.bias.fast is not None:
-            out = F.batch_norm(x, running_mean, running_var, self.weight.fast, self.bias.fast, training=True,
-                               momentum=1)
-            # batch_norm momentum hack: follow hack of Kate Rakelly in pytorch-maml/src/layers.py
-        else:
-            out = F.batch_norm(x, running_mean, running_var, self.weight, self.bias, training=True, momentum=1)
-        return out
-
-
-# Simple Conv Block
-class ConvBlock(nn.Module):
-    maml = False  # Default
-
-    def __init__(self, indim, outdim, pool=True, padding=1):
-        super(ConvBlock, self).__init__()
-        self.indim = indim
-        self.outdim = outdim
-        if self.maml:
-            self.C = Conv2d_fw(indim, outdim, 3, padding=padding)
-            self.BN = BatchNorm2d_fw(outdim)
-        else:
-            self.C = nn.Conv2d(indim, outdim, 3, padding=padding)
-            self.BN = nn.BatchNorm2d(outdim)
-        self.relu = nn.ReLU(inplace=True)
-        self.parametrized_layers = [self.C, self.BN, self.relu]
-        if pool:
-            self.pool = nn.MaxPool2d(2)
-            self.parametrized_layers.append(self.pool)
-        for layer in self.parametrized_layers:
-            init_layer(layer)
-        self.trunk = nn.Sequential(*self.parametrized_layers)
-
-    def forward(self, x):
-        out = self.trunk(x)
-        return out
-
-
-class ConvNetNopool(
-    nn.Module):  # Relation net use a 4 layer conv with pooling in only first two layers, else no pooling
-    def __init__(self, depth):
-        super(ConvNetNopool, self).__init__()
-        trunk = []
-        for i in range(depth):
-            indim = 3 if i == 0 else 64
-            outdim = 64
-            B = ConvBlock(indim, outdim, pool=(i in [0, 1]),
-                          padding=0 if i in [0, 1] else 1)  # only first two layer has pooling and no padding
-            trunk.append(B)
-        self.trunk = nn.Sequential(*trunk)
-        self.final_feat_dim = [64, 19, 19]
-
-    def forward(self, x):
-        out = self.trunk(x)
-        return out
-
-
-def Conv4NP():
-    return ConvNetNopool(4)
-
-
-def ResNet50():
-    model = resnet50(pretrained=True)
-    model = nn.Sequential(*((list(model.children())[:-1])))
-    model.add_module('flatten', Flatten())
-    model.final_feat_dim = 2048
-    return model
-
-
-def ResNet101():
-    model = resnet101(pretrained=True)
-    model = nn.Sequential(*((list(model.children())[:-1])))
-    model.add_module('flatten', Flatten())
-    model.final_feat_dim = 2048
-    return model
-
-
-class ResNet(nn.Module):
-    maml = False  # Default
-
-    def __init__(self, block, list_of_num_layers, list_of_out_dims, flatten=True):
-        # list_of_num_layers specifies number of layers in each stage
-        # list_of_out_dims specifies number of output channel for each stage
-        super(ResNet, self).__init__()
-        assert len(list_of_num_layers) == 4, 'Can have only four stages'
-        if self.maml:
-            conv1 = Conv2d_fw(3, 64, kernel_size=7, stride=2, padding=3,
-                              bias=False)
-            bn1 = BatchNorm2d_fw(64)
-        else:
-            conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3,
-                              bias=False)
-            bn1 = nn.BatchNorm2d(64)
-        relu = nn.ReLU()
-        pool1 = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        init_layer(conv1)
-        init_layer(bn1)
-        trunk = [conv1, bn1, relu, pool1]
-        indim = 64
-        for i in range(4):
-            for j in range(list_of_num_layers[i]):
-                half_res = (i >= 1) and (j == 0)
-                B = block(indim, list_of_out_dims[i], half_res)
-                trunk.append(B)
-                indim = list_of_out_dims[i]
-        if flatten:
-            avgpool = nn.AvgPool2d(7)
-            trunk.append(avgpool)
-            trunk.append(Flatten())
-            self.final_feat_dim = indim
-        else:
-            self.final_feat_dim = [indim, 7, 7]
-        self.trunk = nn.Sequential(*trunk)
-
-    def forward(self, x):
-        out = self.trunk(x)
-        return out
-
-
-# Simple ResNet Block
-class SimpleBlock(nn.Module):
-    maml = False  # Default
-
-    def __init__(self, indim, outdim, half_res):
-        super(SimpleBlock, self).__init__()
-        self.indim = indim
-        self.outdim = outdim
-        if self.maml:
-            self.C1 = Conv2d_fw(indim, outdim, kernel_size=3, stride=2 if half_res else 1, padding=1, bias=False)
-            self.BN1 = BatchNorm2d_fw(outdim)
-            self.C2 = Conv2d_fw(outdim, outdim, kernel_size=3, padding=1, bias=False)
-            self.BN2 = BatchNorm2d_fw(outdim)
-        else:
-            self.C1 = nn.Conv2d(indim, outdim, kernel_size=3, stride=2 if half_res else 1, padding=1, bias=False)
-            self.BN1 = nn.BatchNorm2d(outdim)
-            self.C2 = nn.Conv2d(outdim, outdim, kernel_size=3, padding=1, bias=False)
-            self.BN2 = nn.BatchNorm2d(outdim)
-        self.relu1 = nn.ReLU(inplace=True)
-        self.relu2 = nn.ReLU(inplace=True)
-        self.parametrized_layers = [self.C1, self.C2, self.BN1, self.BN2]
-        self.half_res = half_res
-        # if the input number of channels is not equal to the output, then need a 1x1 convolution
-        if indim != outdim:
-            if self.maml:
-                self.shortcut = Conv2d_fw(indim, outdim, 1, 2 if half_res else 1, bias=False)
-                self.BNshortcut = BatchNorm2d_fw(outdim)
-            else:
-                self.shortcut = nn.Conv2d(indim, outdim, 1, 2 if half_res else 1, bias=False)
-                self.BNshortcut = nn.BatchNorm2d(outdim)
-            self.parametrized_layers.append(self.shortcut)
-            self.parametrized_layers.append(self.BNshortcut)
-            self.shortcut_type = '1x1'
-        else:
-            self.shortcut_type = 'identity'
-        for layer in self.parametrized_layers:
-            init_layer(layer)
-
-    def forward(self, x):
-        out = self.C1(x)
-        out = self.BN1(out)
-        out = self.relu1(out)
-        out = self.C2(out)
-        out = self.BN2(out)
-        short_out = x if self.shortcut_type == 'identity' else self.BNshortcut(self.shortcut(x))
-        out = out + short_out
-        out = self.relu2(out)
-        return out
-
-
-def ResNet18(flatten=True):
-    return ResNet(SimpleBlock, [2, 2, 2, 2], [64, 128, 256, 512], flatten)
-
-
-def ResNet18R(flatten=False):
-    return ResNet(SimpleBlock, [2, 2, 2, 2], [64, 128, 256, 512], flatten)
-
+    def __init__(self, **kwargs): super().__init__()
+    def forward(self, x): return x
+def Conv4NP(): return Conv64F()
+def ResNet18(flatten=True): return Conv64F()
+def ResNet18R(flatten=False): return Conv64F()
+def ResNet50(): return Conv64F()
+def ResNet101(): return Conv64F()
 
 model_dict = {
     'Conv4': Conv64F,
