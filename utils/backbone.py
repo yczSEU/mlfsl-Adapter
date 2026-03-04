@@ -6,8 +6,7 @@ import torch
 import os
 import open_clip
 
-from utils.adapter_pool import APART_PoolWrapper, AdapterRouter
-
+from utils.adapter_pool import APART_PoolWrapper, CoCoOpRouter # <--- 引入新类
 class Flatten(nn.Module):
     def __init__(self):
         super(Flatten, self).__init__()
@@ -55,7 +54,11 @@ class OpenCLIPBackbone(nn.Module):
         if use_adapter:
             print(f"Mode: Adapter Pool (Size={pool_size})")
             # Router 的 bottleneck_dim 也要传，如果 Router 内部用了线性层的话 (你的 Router 代码看起来没用 bottleneck，但传进去无妨)
-            self.router = AdapterRouter(input_dim=self.final_feat_dim, pool_size=pool_size).to(self.device)
+            self.router = CoCoOpRouter(
+                clip_model=self.model, 
+                input_dim=self.final_feat_dim, 
+                pool_size=pool_size
+            ).to(self.device)
             
             # 2. [修改这里] 把死数字 64 改成变量 {bottleneck_dim}
             print(f"Injecting Adapter Pool (Size={pool_size}, Dim=256, Limit=0.05, Init=0.01)...")

@@ -49,12 +49,7 @@ class MLLTemplate(nn.Module):
     def train_loop(self, train_loader):
         self.train()
         
-        # === [修正] 基于 Batch=65 的正确算术 ===
-        # Support 是结构化的: 10 way * 5 shot = 50
         num_support = self.n_way * self.n_shot
-        
-        # Query 是稀疏的: 直接等于 n_query (5)
-        # 不再乘以 n_way
         num_query = self.n_query 
         
         epoch_loss_stats = {} 
@@ -73,21 +68,12 @@ class MLLTemplate(nn.Module):
             x = batch['image'].to(self.device)
             y = batch['labels'].float()
 
-            # ----------------------------------------------------
-            # 安全切片 (适配 Batch=65)
-            # ----------------------------------------------------
-            # x_support: [50, C, H, W]
             x_support = x[:num_support]
             y_support = y[:num_support]
-            
-            # x_query: [5, C, H, W]
             x_query = x[num_support : num_support + num_query]
             y_query = y[num_support : num_support + num_query]
-            
-            # 剩下的 (10) 是 Class Prototypes，用于采样 Sampled Idx
             y_class = y[num_support + num_query:]
             
-            # 筛选活跃类
             sampled_idx = y_class.sum(0).bool()
             y_support = y_support[:, sampled_idx].to(self.device)
             y_query = y_query[:, sampled_idx].to(self.device)
@@ -99,7 +85,6 @@ class MLLTemplate(nn.Module):
             
             self.optimizer.zero_grad()
             
-            # 调用 BCR
             output = self.set_forward_loss(x_support_aug, y_support, x_query, y_query)
             
             if isinstance(output, tuple):
@@ -109,6 +94,17 @@ class MLLTemplate(nn.Module):
                 log_dict = {"Total": loss.item()}
             
             loss.backward()
+            # 👇 --- [开始粘贴：案发现场实时抓拍] --- 👇
+            if num_batches % 50 == 0:
+                print(f"\n🕵️ [Batch {num_batches} 实时抓拍] Backward 刚结束:")
+                try:
+                    r_ctx = self.feature_extractor.router.ctx
+                    r_meta = self.feature_extractor.router.meta_net[0].weight
+                    print(f"  ⚡ 真实 Ctx 梯度: {r_ctx.grad.abs().max().item() if r_ctx.grad is not None else 'None'}")
+                    print(f"  ⚡ 真实 MetaNet 梯度: {r_meta.grad.abs().max().item() if r_meta.grad is not None else 'None'}")
+                except Exception as e:
+                    print(f"  ❌ 抓拍失败: {e}")
+            # 👆 --- [粘贴结束] --- 👆
             self.clip_gradient()
             self.optimizer.step()
             
@@ -123,75 +119,107 @@ class MLLTemplate(nn.Module):
             current_lr = self.scheduler.get_last_lr()[0]
             print(f"[LR Info] Current LR decayed to: {current_lr:.6f}")
 
-        # === Monitor (修改了这里的打印逻辑) ===
-        print("\n[Adapter Pool Monitor]")
+        # === [Monitor Update: CoCoOp & Top-1 Ready] ===
+        print("\n[Adapter Pool Monitor (Top-1 & CoCoOp)]")
         try:
             backbone = self.feature_extractor
+            # 1. 自动定位第一个 Wrapper (兼容不同架构)
             if hasattr(backbone.model, 'visual'):
                 first_wrapper = backbone.model.visual.transformer.resblocks[0].mlp
             else:
                 first_wrapper = backbone.model.blocks[0].mlp
+            
             router = backbone.router
             
+            # --- Part A: Router 监控 (区分 CoCoOp 和 Static) ---
+            print("  > [Router Status]")
+            
+            # 情况 1: CoCoOp Router (动态)
+            if hasattr(router, 'ctx'):
+                # 检查 Context Vector 梯度 (✅ 改用 max 提取最大绝对梯度，防止被 mean 抹零)
+                if router.ctx.grad is not None:
+                    ctx_grad = router.ctx.grad.abs().max().item()
+                    print(f"    Ctx Vector Grad: {ctx_grad:.4e} (✅ Learning)")
+                else:
+                    print(f"    Ctx Vector Grad: None (⚠️ Frozen?)")
+                
+                # 检查 MetaNet 梯度 (看第一层) (✅ 改用 max)
+                if hasattr(router, 'meta_net') and len(router.meta_net) > 0:
+                    first_layer = router.meta_net[0]
+                    if hasattr(first_layer, 'weight') and first_layer.weight.grad is not None:
+                        meta_grad = first_layer.weight.grad.abs().max().item()
+                        print(f"    MetaNet Grad   : {meta_grad:.4e} (✅ Learning)")
+                    else:
+                        print(f"    MetaNet Grad   : None")
+                        
+            # 情况 2: Static Router (旧版)
+            elif hasattr(router, 'prompt_key'):
+                if router.prompt_key.grad is not None:
+                    r_grad = router.prompt_key.grad.abs().max().item()
+                    print(f"    Router Key Grad: {r_grad:.8f}")
+                
+                # 计算 Key 多样性
+                keys = F.normalize(router.prompt_key.data, p=2, dim=1)
+                sim_matrix = torch.matmul(keys, keys.t())
+                avg_inter_sim = (sim_matrix.sum() - keys.shape[0]) / (keys.shape[0] * (keys.shape[0]-1))
+                print(f"    Key Diversity  : Avg Sim = {avg_inter_sim:.4f}")
+
+            # --- Part B: Expert 统计 ---
             usage_counts = []
             if hasattr(router, 'expert_usage_counts'):
                 usage_counts = router.expert_usage_counts.cpu().tolist()
             total_calls = sum(usage_counts) + 1e-6
-            
-            active_id = first_wrapper.active_idx
-            
-            if router.prompt_key.grad is not None:
-                r_grad = router.prompt_key.grad.abs().mean().item()
-                print(f"    Router Key Grad: {r_grad:.8f} (Learning!)")
-            else:
-                print("    Router Key Grad: None")
 
-            keys = F.normalize(router.prompt_key.data, p=2, dim=1)
-            sim_matrix = torch.matmul(keys, keys.t())
-            avg_inter_sim = (sim_matrix.sum() - keys.shape[0]) / (keys.shape[0] * (keys.shape[0]-1))
-            print(f"    Router Diversity: Avg Key Sim = {avg_inter_sim:.4f}")
-
-            print(f"  > [Experts Stats in Layer 0] (Total: {len(first_wrapper.adapters)})")
-            print(f"    {'ID':<3} | {'Usage (Epoch)':<15} | {'State':<8} | {'Scale':<10} | {'Weight Norm':<12} | {'Grad (Last Batch)'}")
-            print("    " + "-" * 85)
+            print(f"  > [Experts Stats (Layer 0)]")
+            print(f"    {'ID':<3} | {'Usage (Top-1)':<15} | {'State':<8} | {'Scale (Mean) [Grad]':<25} | {'Weight Grad'}")
+            print("    " + "-" * 90)
             
             for i, adapter in enumerate(first_wrapper.adapters):
-                state = "ACTIVE" if i == active_id else "Sleep"
+                # 1. 检查是否有梯度 (✅ 这里也改用了 max)
+                has_grad_bool = False
+                grad_norm_str = "None"
+                if adapter.up_proj.weight.grad is not None:
+                    has_grad_bool = True
+                    g_val = adapter.up_proj.weight.grad.abs().max().item()
+                    grad_norm_str = f"{g_val:.1e}"
+                
+                state = "ACTIVE" if has_grad_bool else "---"
+                prefix = ">> " if has_grad_bool else "   "
+                
+                # 2. 使用率
                 if usage_counts:
                     count = usage_counts[i]
                     percent = (count / total_calls) * 100.0
-                    usage_str = f"{count:<5} ({percent:4.1f}%)"
+                    usage_str = f"{int(count):<5} ({percent:4.1f}%)"
                 else:
                     usage_str = "N/A"
 
-                # [修正开始] =============================================
-                # 使用正确的公式：Scale = Min + (Max - Min) * Sigmoid
-                logits = adapter.scale_logits.data
-                probs = torch.sigmoid(logits)
-                
-                # 动态获取当前 Adapter 的配置，防止日志公式和实际训练不一致
-                min_s = getattr(adapter, 'min_scale_val', 0.0) 
-                max_s = getattr(adapter, 'max_scale_val', 0.20)
-                
-                real_scale = min_s + (max_s - min_s) * probs
-                # [修正结束] =============================================
+                # 3. Scale 状态
+                scale_str = "N/A"
+                if hasattr(adapter, 'channel_scale_logits'):
+                    s_param = adapter.channel_scale_logits
+                    
+                    # 梯度
+                    s_grad = "No"
+                    if s_param.grad is not None:
+                        s_grad = f"{s_param.grad.abs().max().item():.1e}"
+                    
+                    # 数值 (Mean)
+                    with torch.no_grad():
+                        probs = torch.sigmoid(s_param)
+                        min_s, max_s = 0.01, 0.10 # 这里要和你定义的对应
+                        scales = min_s + (max_s - min_s) * probs
+                        s_mean = scales.mean().item()
+                    
+                    scale_str = f"{s_mean:.4f} [G:{s_grad}]"
 
-                w_norm = adapter.up_proj.weight.data.abs().mean().item()
+                print(f"  {prefix}{i:<3} | {usage_str:<15} | {state:<8} | {scale_str:<25} | {grad_norm_str}")
                 
-                if adapter.up_proj.weight.grad is not None:
-                    grad_norm = adapter.up_proj.weight.grad.abs().mean().item()
-                    has_grad = f"YES ({grad_norm:.1e})"
-                else:
-                    has_grad = "no"
-                
-                prefix = ">> " if i == active_id else "   "
-                print(f"  {prefix}{i:<3} | {usage_str:<15} | {state:<8} | {real_scale.item():.6f}   | {w_norm:.6f}     | {has_grad}")
-                
-        except AttributeError as e:
-            print(f"  Warning: Monitor failed. Error: {e}")
-        print("-" * 50)
+        except Exception as e:
+            print(f"  Warning: Monitor error: {e}")
+        print("-" * 110)
 
-        # Loss 打印
+        # Loss 打印 (保持不变)
         print("  > [Loss Breakdown (Avg)]")
         loss_str = "    "
         for k, v in epoch_loss_stats.items():
@@ -199,7 +227,7 @@ class MLLTemplate(nn.Module):
                 avg_val = v / num_batches
                 loss_str += f"{k}: {avg_val:.4f} | "
         print(loss_str)
-        print("-" * 50)
+        print("-" * 110)
 
         if num_batches > 0:
             return epoch_loss_stats.get("Total", 0.0) / num_batches
